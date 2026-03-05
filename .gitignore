@@ -1,0 +1,29 @@
+# Elixir / Mix
+/_build/
+/deps/
+/cover/
+/doc/
+erl_crash.dump
+*.ez
+
+# Elixir LS / local tooling
+/.elixir_ls/
+/.mix/
+
+# Rust (native helper)
+/native/steward_mock_agent/target/
+
+# IDE / editor
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Override global ignores for this Elixir app layout
+!/lib/
+!/lib/**
