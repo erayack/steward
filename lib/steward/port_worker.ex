@@ -80,6 +80,7 @@ defmodule Steward.PortWorker do
           |> Map.put(:last_event, %{type: :port_opened, os_pid: os_pid, at: now})
           |> publish_snapshot()
 
+        append_audit_event(state.process_id, :worker_started, %{os_pid: os_pid, at: now})
         {:ok, next_state}
 
       {:error, reason} ->
@@ -151,6 +152,8 @@ defmodule Steward.PortWorker do
       at_ms: now_ms
     })
 
+    append_audit_event(state.process_id, :worker_port_exit, %{exit_code: code, at_ms: now_ms})
+
     base_state = state_after_exit(state, code, now_ms)
 
     if code == 0 do
@@ -168,6 +171,11 @@ defmodule Steward.PortWorker do
             |> quarantine_state(cooldown_ms, quarantined_until_ms)
 
           StatusStore.record_control_event(state.process_id, :quarantined, %{
+            cooldown_ms: cooldown_ms,
+            quarantined_until_ms: quarantined_until_ms
+          })
+
+          append_audit_event(state.process_id, :worker_quarantine_entered, %{
             cooldown_ms: cooldown_ms,
             quarantined_until_ms: quarantined_until_ms
           })
@@ -201,12 +209,15 @@ defmodule Steward.PortWorker do
     case restart_port(base_state) do
       {:ok, next_state} ->
         StatusStore.record_control_event(state.process_id, :quarantine_released, %{})
+        append_audit_event(state.process_id, :worker_quarantine_exited, %{})
         {:noreply, next_state}
 
       {:error, reason, next_state} ->
         StatusStore.record_control_event(state.process_id, :restart_failed, %{
           reason: inspect(reason)
         })
+
+        append_audit_event(state.process_id, :worker_restart_failed, %{reason: inspect(reason)})
 
         {:noreply, next_state}
     end
@@ -274,6 +285,11 @@ defmodule Steward.PortWorker do
 
   defp emit_malformed(raw_line, state) do
     StatusStore.record_control_event(state.process_id, :malformed, %{payload: raw_line})
+
+    append_audit_event(state.process_id, :protocol_malformed_line, %{
+      payload: raw_line,
+      bytes: byte_size(raw_line)
+    })
 
     state
     |> Map.put(:last_event, %{type: :malformed, raw: raw_line, at: DateTime.utc_now()})
@@ -348,6 +364,7 @@ defmodule Steward.PortWorker do
           |> publish_snapshot()
 
         StatusStore.record_control_event(state.process_id, :restarted, %{os_pid: os_pid})
+        append_audit_event(state.process_id, :worker_restarted, %{os_pid: os_pid})
         {:ok, next_state}
 
       {:error, reason} ->
@@ -374,6 +391,8 @@ defmodule Steward.PortWorker do
         StatusStore.record_control_event(state.process_id, :restart_failed, %{
           reason: inspect(reason)
         })
+
+        append_audit_event(state.process_id, :worker_restart_failed, %{reason: inspect(reason)})
 
         next_state
     end
@@ -452,5 +471,19 @@ defmodule Steward.PortWorker do
       crash_timestamps_ms: state.crash_timestamps_ms,
       quarantined_until_ms: state.quarantined_until_ms
     }
+  end
+
+  defp append_audit_event(process_id, event, payload) do
+    _ =
+      StatusStore.append_event(%{
+        entity: :worker,
+        event: event,
+        process_id: process_id,
+        payload: payload
+      })
+
+    :ok
+  rescue
+    _ -> :ok
   end
 end

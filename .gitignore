@@ -12,6 +12,8 @@ erl_crash.dump
 
 # Rust (native helper)
 /native/steward_mock_agent/target/
+/native/steward_mock_agent/steward_mock_agent
+/native/steward_mock_agent/*.exe
 
 # IDE / editor
 /.idea/

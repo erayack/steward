@@ -7,6 +7,7 @@ defmodule Steward.MixProject do
       version: "0.1.0",
       elixir: "~> 1.16",
       start_permanent: Mix.env() == :prod,
+      escript: [main_module: Steward],
       deps: deps()
     ]
   end
@@ -14,7 +15,7 @@ defmodule Steward.MixProject do
   def application do
     [
       mod: {Steward.Application, []},
-      extra_applications: [:logger, :runtime_tools]
+      extra_applications: [:logger, :runtime_tools, :inets, :ssl]
     ]
   end
 

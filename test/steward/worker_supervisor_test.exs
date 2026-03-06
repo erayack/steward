@@ -3,7 +3,7 @@ defmodule Steward.WorkerSupervisorTest do
 
   import ExUnit.CaptureLog
 
-  alias Steward.WorkerSupervisor
+  alias Steward.{ClusterMembership, WorkerSupervisor}
 
   # ---------------------------------------------------------------------------
   # valid_process_id?/1
@@ -78,6 +78,24 @@ defmodule Steward.WorkerSupervisorTest do
       assert [%{args: ["--flag"]}] = WorkerSupervisor.normalize_worker_spec(spec)
     end
 
+    test "valid api worker with atom keys returns spec" do
+      spec = %{process_id: "api_1", transport: :api, base_url: "http://127.0.0.1:5001"}
+
+      assert [%{process_id: "api_1", transport: :api, base_url: "http://127.0.0.1:5001"}] =
+               WorkerSupervisor.normalize_worker_spec(spec)
+    end
+
+    test "valid api worker with string keys returns spec" do
+      spec = %{
+        "process_id" => "api_2",
+        "transport" => "api",
+        "base_url" => "http://127.0.0.1:5002"
+      }
+
+      assert [%{process_id: "api_2", transport: :api, base_url: "http://127.0.0.1:5002"}] =
+               WorkerSupervisor.normalize_worker_spec(spec)
+    end
+
     test "missing process_id returns empty list" do
       log =
         capture_log(fn ->
@@ -140,19 +158,12 @@ defmodule Steward.WorkerSupervisorTest do
   describe "bootstrap_specs/0" do
     setup do
       prev_workers = Application.get_env(:steward, :workers)
-      prev_mock = Application.get_env(:steward, :mock_agent)
 
       on_exit(fn ->
         if prev_workers do
           Application.put_env(:steward, :workers, prev_workers)
         else
           Application.delete_env(:steward, :workers)
-        end
-
-        if prev_mock do
-          Application.put_env(:steward, :mock_agent, prev_mock)
-        else
-          Application.delete_env(:steward, :mock_agent)
         end
       end)
 
@@ -182,35 +193,18 @@ defmodule Steward.WorkerSupervisorTest do
       assert hd(specs).process_id == "dup"
     end
 
-    test "falls back to mock agent when :workers is empty list" do
+    test "returns empty when :workers is empty list" do
       Application.put_env(:steward, :workers, [])
-      Application.put_env(:steward, :mock_agent, path: "/bin/cat", args: [])
 
       specs = WorkerSupervisor.bootstrap_specs()
-      ids = Enum.map(specs, & &1.process_id)
-      assert "mock_agent" in ids
+      assert specs == []
     end
 
-    test "falls back to mock agent when :workers is not set" do
+    test "returns empty when :workers is not set" do
       Application.delete_env(:steward, :workers)
-      Application.put_env(:steward, :mock_agent, path: "/bin/cat", args: [])
 
       specs = WorkerSupervisor.bootstrap_specs()
-      ids = Enum.map(specs, & &1.process_id)
-      assert "mock_agent" in ids
-    end
-
-    test "returns empty when no :workers and mock agent binary does not exist" do
-      Application.delete_env(:steward, :workers)
-      Application.put_env(:steward, :mock_agent, path: "/nonexistent/binary", args: [])
-
-      log =
-        capture_log(fn ->
-          specs = WorkerSupervisor.bootstrap_specs()
-          assert specs == []
-        end)
-
-      assert log =~ "mock agent binary not found"
+      assert specs == []
     end
 
     test "skips invalid entries in :workers list" do
@@ -253,7 +247,13 @@ defmodule Steward.WorkerSupervisorTest do
         )
 
       on_exit(fn ->
-        if Process.alive?(ws_pid), do: GenServer.stop(ws_pid)
+        if Process.alive?(ws_pid) do
+          try do
+            GenServer.stop(ws_pid)
+          catch
+            :exit, _ -> :ok
+          end
+        end
       end)
 
       %{ws: ws_name, registry: registry_name, ds: ds_name}
@@ -297,6 +297,26 @@ defmodule Steward.WorkerSupervisorTest do
                GenServer.call(ws, {:ensure_worker, "bad_args", "/bin/cat", [1]})
     end
 
+    test "ensure/terminate updates cluster membership", %{ws: ws} do
+      process_id = "itest_term_#{System.unique_integer([:positive])}"
+
+      pre_snapshot = ClusterMembership.snapshot()
+      pre_members = Map.get(pre_snapshot.processes_by_node, node(), MapSet.new())
+
+      {:ok, pid} = GenServer.call(ws, {:ensure_worker, process_id, "/bin/cat", []})
+      Process.sleep(20)
+      assert MapSet.member?(ClusterMembership.snapshot().processes_by_node[node()], process_id)
+
+      assert :ok = GenServer.call(ws, {:terminate_worker, process_id})
+      Process.sleep(20)
+      refute Process.alive?(pid)
+
+      post_snapshot = ClusterMembership.snapshot()
+      post_members = Map.get(post_snapshot.processes_by_node, node(), MapSet.new())
+      refute MapSet.member?(post_members, process_id)
+      assert MapSet.subset?(pre_members, post_members)
+    end
+
     test "terminate_worker removes worker", %{ws: ws} do
       {:ok, pid} = GenServer.call(ws, {:ensure_worker, "itest_term", "/bin/cat", []})
       assert Process.alive?(pid)
@@ -322,6 +342,7 @@ defmodule Steward.WorkerSupervisorTest do
       for ref <- refs do
         assert Map.has_key?(ref, :process_id)
         assert Map.has_key?(ref, :pid)
+        assert ref.transport == :port
         assert is_pid(ref.pid)
       end
 
@@ -331,6 +352,34 @@ defmodule Steward.WorkerSupervisorTest do
 
     test "list_workers is empty when no workers started", %{ws: ws} do
       assert [] = GenServer.call(ws, :list_workers)
+    end
+
+    test "bootstrap supports api workers without starting local ports", %{ws: ws} do
+      prev_workers = Application.get_env(:steward, :workers)
+
+      on_exit(fn ->
+        if prev_workers do
+          Application.put_env(:steward, :workers, prev_workers)
+        else
+          Application.delete_env(:steward, :workers)
+        end
+      end)
+
+      process_id = "api_worker_#{System.unique_integer([:positive])}"
+
+      Application.put_env(:steward, :workers, [
+        %{process_id: process_id, transport: :api, base_url: "http://127.0.0.1:5051"}
+      ])
+
+      ws_pid = Process.whereis(ws)
+      send(ws_pid, :bootstrap_workers)
+      Process.sleep(50)
+
+      refs = GenServer.call(ws, :list_workers)
+
+      assert [%{process_id: ^process_id, pid: nil, transport: :api, base_url: base_url}] = refs
+      assert base_url == "http://127.0.0.1:5051"
+      assert_attached_in_membership(process_id)
     end
 
     test "list_workers excludes terminated workers", %{ws: ws} do
@@ -389,6 +438,8 @@ defmodule Steward.WorkerSupervisorTest do
       refs = GenServer.call(ws_name, :list_workers)
       ids = Enum.map(refs, & &1.process_id) |> Enum.sort()
       assert ids == ["boot_a", "boot_b"]
+      assert_attached_in_membership("boot_a")
+      assert_attached_in_membership("boot_b")
 
       GenServer.stop(ws_pid)
     end
@@ -422,6 +473,27 @@ defmodule Steward.WorkerSupervisorTest do
       assert log =~ "failed to bootstrap worker boot_bad"
 
       GenServer.stop(ws_pid)
+    end
+  end
+
+  defp assert_attached_in_membership(process_id),
+    do: assert_attached_in_membership(process_id, 30)
+
+  defp assert_attached_in_membership(_process_id, 0),
+    do: flunk("process was not attached in cluster membership")
+
+  defp assert_attached_in_membership(process_id, attempts_left) do
+    attached? =
+      ClusterMembership.snapshot()
+      |> Map.get(:processes_by_node, %{})
+      |> Map.get(node(), MapSet.new())
+      |> MapSet.member?(process_id)
+
+    if attached? do
+      :ok
+    else
+      Process.sleep(10)
+      assert_attached_in_membership(process_id, attempts_left - 1)
     end
   end
 end

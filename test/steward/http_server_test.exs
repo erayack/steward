@@ -3,11 +3,11 @@ defmodule Steward.HttpServer.PlugTest do
 
   import Plug.Test
 
-  alias Steward.HttpServer.Plug, as: HealthPlug
+  alias StewardWeb.Router
 
   describe "GET /health" do
     test "responds with 200 and \"ok\"" do
-      conn = conn(:get, "/health") |> HealthPlug.call(HealthPlug.init([]))
+      conn = conn(:get, "/health") |> Router.call(Router.init([]))
 
       assert conn.status == 200
       assert conn.resp_body == "ok"
@@ -15,11 +15,10 @@ defmodule Steward.HttpServer.PlugTest do
   end
 
   describe "GET /unknown" do
-    test "responds with 404 and \"not found\"" do
-      conn = conn(:get, "/unknown") |> HealthPlug.call(HealthPlug.init([]))
-
-      assert conn.status == 404
-      assert conn.resp_body == "not found"
+    test "raises no route error" do
+      assert_raise Phoenix.Router.NoRouteError, fn ->
+        conn(:get, "/unknown") |> Router.call(Router.init([]))
+      end
     end
   end
 end

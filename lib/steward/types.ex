@@ -10,7 +10,23 @@ defmodule Steward.Types do
   @type run_status :: :pending | :running | :done
 
   @type port_kind :: :heartbeat | :metric | :event | :error
-  @type run_result :: :success | :fail | :timeout | :already_applied
+  @type run_result ::
+          :success
+          | :fail
+          | :timeout
+          | :already_applied
+          | :not_found
+          | :rpc_error
+  @type run_summary :: %{
+          run_id: run_id(),
+          action: atom(),
+          targets: [process_id()],
+          status: run_status(),
+          results: %{optional(process_id()) => run_result() | term()},
+          started_at: DateTime.t() | nil,
+          finished_at: DateTime.t() | nil,
+          meta: map()
+        }
 
   @type run :: Steward.Types.Run.t()
   @type port_envelope :: Steward.Types.PortEnvelope.t()
@@ -36,10 +52,10 @@ defmodule Steward.Types.Run do
           run_id: Steward.Types.run_id(),
           action: atom(),
           targets: [Steward.Types.process_id()],
-          params: map() | nil,
+          params: map(),
           desired_config_version: String.t() | nil,
-          status: Steward.Types.run_status() | nil,
-          results: %{optional(Steward.Types.process_id()) => Steward.Types.run_result()} | nil,
+          status: Steward.Types.run_status(),
+          results: %{optional(Steward.Types.process_id()) => Steward.Types.run_result() | term()},
           started_at: DateTime.t() | nil,
           finished_at: DateTime.t() | nil
         }

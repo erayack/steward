@@ -5,7 +5,19 @@ defmodule Steward.StatusStoreTest do
 
   setup do
     pid = Process.whereis(StatusStore) || start_supervised!(StatusStore)
-    :sys.replace_state(StatusStore, fn _ -> %{processes: %{}, control_events: %{}} end)
+
+    :sys.replace_state(StatusStore, fn _ ->
+      %{
+        processes: %{},
+        control_events: %{},
+        membership: %{nodes: %{}, processes_by_node: %{}},
+        runs: %{active_runs: %{}, completed_runs: %{}, counts: %{}},
+        audit_events: [],
+        malformed_line_counts: %{},
+        audit_seq: 0,
+        updated_at_ms: System.monotonic_time(:millisecond)
+      }
+    end)
 
     {:ok, pid: pid}
   end
@@ -107,6 +119,34 @@ defmodule Steward.StatusStoreTest do
 
     test "list_control_events returns empty list" do
       assert StatusStore.list_control_events("nope") == []
+    end
+  end
+
+  describe "append_event/1 + recent_events/1" do
+    test "stores events in reverse-chronological access order" do
+      assert :ok = StatusStore.append_event(%{event: :first, payload: %{x: 1}})
+      assert :ok = StatusStore.append_event(%{event: :second, payload: %{x: 2}})
+
+      events = StatusStore.recent_events(2)
+      assert length(events) == 2
+      assert Enum.map(events, & &1.event) == [:second, :first]
+      assert Enum.all?(events, &is_integer(&1.event_id))
+      assert Enum.all?(events, &is_integer(&1.ts_ms))
+    end
+
+    test "increments malformed protocol counters per process" do
+      assert :ok =
+               StatusStore.append_event(%{event: :protocol_malformed_line, process_id: "proc_1"})
+
+      assert :ok =
+               StatusStore.append_event(%{event: :protocol_malformed_line, process_id: "proc_1"})
+
+      assert :ok =
+               StatusStore.append_event(%{event: :protocol_malformed_line, process_id: "proc_2"})
+
+      snapshot = StatusStore.snapshot()
+      assert snapshot.malformed_line_counts["proc_1"] == 2
+      assert snapshot.malformed_line_counts["proc_2"] == 1
     end
   end
 end

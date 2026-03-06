@@ -8,9 +8,21 @@ defmodule Steward.WorkerSupervisor do
 
   @worker_registry Steward.WorkerRegistry
   @worker_dynamic_supervisor Steward.WorkerDynamicSupervisor
-  @bootstrap_process_id "mock_agent"
 
-  @type worker_ref :: %{process_id: Types.process_id(), pid: pid()}
+  @type worker_ref :: %{
+          process_id: Types.process_id(),
+          pid: pid() | nil,
+          transport: :port | :api,
+          base_url: String.t() | nil
+        }
+
+  @type api_worker :: %{process_id: Types.process_id(), transport: :api, base_url: String.t()}
+  @type port_worker :: %{
+          process_id: Types.process_id(),
+          binary_path: String.t(),
+          args: [String.t()]
+        }
+  @type normalized_worker_spec :: api_worker() | port_worker()
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -39,7 +51,8 @@ defmodule Steward.WorkerSupervisor do
     state = %{
       registry: Keyword.get(opts, :registry, @worker_registry),
       dynamic_supervisor: Keyword.get(opts, :dynamic_supervisor, @worker_dynamic_supervisor),
-      bootstrap?: Keyword.get(opts, :bootstrap?, true)
+      bootstrap?: Keyword.get(opts, :bootstrap?, true),
+      api_workers: %{}
     }
 
     if state.bootstrap?, do: send(self(), :bootstrap_workers)
@@ -60,51 +73,91 @@ defmodule Steward.WorkerSupervisor do
           {:error, :invalid_args}
 
         true ->
-          do_ensure_worker(process_id, binary_path, args, state)
+          do_ensure_port_worker(process_id, binary_path, args, state)
       end
+
+    if match?({:ok, _pid}, result) do
+      Steward.ClusterMembership.attach_process(node(), process_id)
+    end
 
     {:reply, result, state}
   end
 
   def handle_call({:terminate_worker, process_id}, _from, state) do
-    result =
-      case lookup_worker_pid(process_id, state.registry) do
-        {:ok, pid} ->
-          case DynamicSupervisor.terminate_child(state.dynamic_supervisor, pid) do
-            :ok -> :ok
-            {:error, :not_found} -> :ok
-          end
+    {result, next_state} =
+      case Map.has_key?(state.api_workers, process_id) do
+        true ->
+          {:ok, %{state | api_workers: Map.delete(state.api_workers, process_id)}}
 
-        :error ->
-          :ok
+        false ->
+          result =
+            case lookup_worker_pid(process_id, state.registry) do
+              {:ok, pid} ->
+                case DynamicSupervisor.terminate_child(state.dynamic_supervisor, pid) do
+                  :ok -> :ok
+                  {:error, :not_found} -> :ok
+                end
+
+              :error ->
+                :ok
+            end
+
+          {result, state}
       end
 
-    {:reply, result, state}
+    Steward.ClusterMembership.detach_process(node(), process_id)
+    {:reply, result, next_state}
   end
 
   def handle_call(:list_workers, _from, state) do
-    {:reply, list_worker_refs(state.registry), state}
+    {:reply, list_worker_refs(state.registry, state.api_workers), state}
   end
 
   @impl true
   def handle_info(:bootstrap_workers, state) do
-    bootstrap_specs()
-    |> Enum.each(fn %{process_id: process_id, binary_path: binary_path, args: args} ->
-      case do_ensure_worker(process_id, binary_path, args, state) do
-        {:ok, _pid} ->
-          :ok
+    {next_state, _results} =
+      bootstrap_specs()
+      |> Enum.reduce({state, []}, fn spec, {acc_state, acc_results} ->
+        case do_ensure_worker_spec(spec, acc_state) do
+          {:ok, process_id, new_state} ->
+            Steward.ClusterMembership.attach_process(node(), process_id)
+            {new_state, [{process_id, :ok} | acc_results]}
 
-        {:error, reason} ->
-          Logger.error("failed to bootstrap worker #{process_id}: #{inspect(reason)}")
-      end
-    end)
+          {:error, process_id, reason, new_state} ->
+            Logger.error("failed to bootstrap worker #{process_id}: #{inspect(reason)}")
+            {new_state, [{process_id, {:error, reason}} | acc_results]}
+        end
+      end)
 
-    {:noreply, state}
+    {:noreply, next_state}
   end
 
   def handle_info(_message, state), do: {:noreply, state}
 
-  defp do_ensure_worker(process_id, binary_path, args, state) do
+  defp do_ensure_worker_spec(
+         %{process_id: process_id, transport: :api, base_url: base_url},
+         state
+       ) do
+    if Map.has_key?(state.api_workers, process_id) do
+      {:ok, process_id, state}
+    else
+      api_worker = %{process_id: process_id, transport: :api, base_url: base_url}
+      next_state = put_in(state, [:api_workers, process_id], api_worker)
+      {:ok, process_id, next_state}
+    end
+  end
+
+  defp do_ensure_worker_spec(
+         %{process_id: process_id, binary_path: binary_path, args: args},
+         state
+       ) do
+    case do_ensure_port_worker(process_id, binary_path, args, state) do
+      {:ok, _pid} -> {:ok, process_id, state}
+      {:error, reason} -> {:error, process_id, reason, state}
+    end
+  end
+
+  defp do_ensure_port_worker(process_id, binary_path, args, state) do
     case lookup_worker_pid(process_id, state.registry) do
       {:ok, pid} ->
         {:ok, pid}
@@ -119,9 +172,7 @@ defmodule Steward.WorkerSupervisor do
   end
 
   defp normalize_start_result({:ok, pid}, _process_id, _registry), do: {:ok, pid}
-
   defp normalize_start_result({:ok, pid, _info}, _process_id, _registry), do: {:ok, pid}
-
   defp normalize_start_result(:ignore, _process_id, _registry), do: {:error, :ignored}
 
   defp normalize_start_result({:error, {:already_started, pid}}, _process_id, _registry),
@@ -165,11 +216,23 @@ defmodule Steward.WorkerSupervisor do
     end
   end
 
-  defp list_worker_refs(registry) do
-    registry
-    |> Registry.select([{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
-    |> Enum.filter(fn {_process_id, pid} -> is_pid(pid) and Process.alive?(pid) end)
-    |> Enum.map(fn {process_id, pid} -> %{process_id: process_id, pid: pid} end)
+  defp list_worker_refs(registry, api_workers) do
+    port_refs =
+      registry
+      |> Registry.select([{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
+      |> Enum.filter(fn {_process_id, pid} -> is_pid(pid) and Process.alive?(pid) end)
+      |> Enum.map(fn {process_id, pid} ->
+        %{process_id: process_id, pid: pid, transport: :port, base_url: nil}
+      end)
+
+    api_refs =
+      api_workers
+      |> Map.values()
+      |> Enum.map(fn %{process_id: process_id, base_url: base_url} ->
+        %{process_id: process_id, pid: nil, transport: :api, base_url: base_url}
+      end)
+
+    (port_refs ++ api_refs)
     |> Enum.sort_by(& &1.process_id)
   end
 
@@ -182,21 +245,19 @@ defmodule Steward.WorkerSupervisor do
         |> Enum.uniq_by(& &1.process_id)
 
       _ ->
-        mock_agent_bootstrap_spec()
+        []
     end
   end
 
   @doc false
   def normalize_worker_spec(%{} = worker) do
+    transport = Map.get(worker, :transport) || Map.get(worker, "transport")
     process_id = Map.get(worker, :process_id) || Map.get(worker, "process_id")
-    binary_path = Map.get(worker, :binary_path) || Map.get(worker, "binary_path")
-    args = Map.get(worker, :args) || Map.get(worker, "args") || []
 
-    if valid_process_id?(process_id) and is_binary(binary_path) and valid_args?(args) do
-      [%{process_id: process_id, binary_path: binary_path, args: args}]
-    else
-      Logger.warning("skipping invalid worker bootstrap entry: #{inspect(worker)}")
-      []
+    case transport do
+      :api -> normalize_api_spec(worker, process_id)
+      "api" -> normalize_api_spec(worker, process_id)
+      _ -> normalize_port_spec(worker, process_id)
     end
   end
 
@@ -205,28 +266,25 @@ defmodule Steward.WorkerSupervisor do
     []
   end
 
-  defp mock_agent_bootstrap_spec do
-    mock_agent_cfg = Application.get_env(:steward, :mock_agent, [])
-    mock_agent_path = Keyword.get(mock_agent_cfg, :path)
-    mock_agent_args = Keyword.get(mock_agent_cfg, :args, [])
+  defp normalize_api_spec(worker, process_id) do
+    base_url = Map.get(worker, :base_url) || Map.get(worker, "base_url")
 
-    if is_binary(mock_agent_path) and valid_args?(mock_agent_args) and
-         File.exists?(mock_agent_path) do
-      [
-        %{
-          process_id: @bootstrap_process_id,
-          binary_path: mock_agent_path,
-          args: mock_agent_args
-        }
-      ]
+    if valid_process_id?(process_id) and is_binary(base_url) and base_url != "" do
+      [%{process_id: process_id, transport: :api, base_url: base_url}]
     else
-      if is_binary(mock_agent_path) and mock_agent_path != "" and
-           not File.exists?(mock_agent_path) do
-        Logger.warning(
-          "mock agent binary not found, skipping bootstrap: #{inspect(mock_agent_path)}"
-        )
-      end
+      Logger.warning("skipping invalid worker bootstrap entry: #{inspect(worker)}")
+      []
+    end
+  end
 
+  defp normalize_port_spec(worker, process_id) do
+    binary_path = Map.get(worker, :binary_path) || Map.get(worker, "binary_path")
+    args = Map.get(worker, :args) || Map.get(worker, "args") || []
+
+    if valid_process_id?(process_id) and is_binary(binary_path) and valid_args?(args) do
+      [%{process_id: process_id, binary_path: binary_path, args: args}]
+    else
+      Logger.warning("skipping invalid worker bootstrap entry: #{inspect(worker)}")
       []
     end
   end
