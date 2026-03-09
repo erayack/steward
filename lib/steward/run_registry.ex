@@ -222,6 +222,8 @@ defmodule Steward.RunRegistry do
       results: run.results,
       started_at: run.started_at,
       finished_at: run.finished_at,
+      trigger_source: run.trigger_source,
+      trigger_reason: run.trigger_reason,
       meta: completion
     }
   end

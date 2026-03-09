@@ -12,6 +12,7 @@ defmodule Steward.StatusStoreTest do
         control_events: %{},
         membership: %{nodes: %{}, processes_by_node: %{}},
         runs: %{active_runs: %{}, completed_runs: %{}, counts: %{}},
+        metric_baselines: %{},
         audit_events: [],
         malformed_line_counts: %{},
         audit_seq: 0,
@@ -39,6 +40,29 @@ defmodule Steward.StatusStoreTest do
       :ok = StatusStore.upsert_process_snapshot("proc_1", %{v: 2})
 
       assert StatusStore.get_process_snapshot("proc_1") == %{v: 2}
+    end
+
+    test "maintains metric baselines from process snapshots" do
+      :ok =
+        StatusStore.upsert_process_snapshot("proc_1", %{
+          metrics: %{"cpu" => 20, "vantage_pct" => 90.0}
+        })
+
+      :ok =
+        StatusStore.upsert_process_snapshot("proc_2", %{
+          metrics: %{"cpu" => 40, "vantage_pct" => 80.0}
+        })
+
+      snapshot = StatusStore.snapshot()
+
+      assert snapshot.metric_baselines["cpu"] == %{avg: 30.0, min: 20.0, max: 40.0, count: 2}
+
+      assert snapshot.metric_baselines["vantage_pct"] == %{
+               avg: 85.0,
+               min: 80.0,
+               max: 90.0,
+               count: 2
+             }
     end
   end
 
@@ -147,6 +171,37 @@ defmodule Steward.StatusStoreTest do
       snapshot = StatusStore.snapshot()
       assert snapshot.malformed_line_counts["proc_1"] == 2
       assert snapshot.malformed_line_counts["proc_2"] == 1
+    end
+
+    test "snapshot includes self-healing trigger fields" do
+      prev_self_healing = Application.get_env(:steward, :self_healing, [])
+
+      Application.put_env(
+        :steward,
+        :self_healing,
+        Keyword.merge(prev_self_healing, cooldown_ms: 30_000)
+      )
+
+      on_exit(fn -> Application.put_env(:steward, :self_healing, prev_self_healing) end)
+
+      assert :ok =
+               StatusStore.append_event(%{
+                 entity: :automation,
+                 event: :automation_triggered,
+                 trigger_reason: %{signal: :vantage_drop_pct, drop_pct: 32.1}
+               })
+
+      snapshot = StatusStore.snapshot()
+
+      assert is_integer(snapshot.self_healing.last_trigger_at_ms)
+
+      assert snapshot.self_healing.last_trigger_reason == %{
+               signal: :vantage_drop_pct,
+               drop_pct: 32.1
+             }
+
+      assert is_integer(snapshot.self_healing.cooldown_remaining_ms)
+      assert snapshot.self_healing.cooldown_remaining_ms >= 0
     end
   end
 end

@@ -297,6 +297,26 @@ defmodule Steward.WorkerSupervisorTest do
                GenServer.call(ws, {:ensure_worker, "bad_args", "/bin/cat", [1]})
     end
 
+    test "upgrade_worker returns error when hot swap is disabled", %{ws: ws} do
+      prev_hot_swap = Application.get_env(:steward, :hot_swap, [])
+      Application.put_env(:steward, :hot_swap, Keyword.merge(prev_hot_swap, enabled: false))
+      on_exit(fn -> Application.put_env(:steward, :hot_swap, prev_hot_swap) end)
+
+      assert {:error, :hot_swap_disabled} =
+               GenServer.call(ws, {:upgrade_worker, "itest_1", "/bin/cat", [], []})
+    end
+
+    test "upgrade_worker starts when hot swap is enabled", %{ws: ws} do
+      prev_hot_swap = Application.get_env(:steward, :hot_swap, [])
+      Application.put_env(:steward, :hot_swap, Keyword.merge(prev_hot_swap, enabled: true))
+      on_exit(fn -> Application.put_env(:steward, :hot_swap, prev_hot_swap) end)
+
+      assert {:ok, _pid} = GenServer.call(ws, {:ensure_worker, "itest_upgrade", "/bin/cat", []})
+      assert :ok = GenServer.call(ws, {:upgrade_worker, "itest_upgrade", "/bin/cat", [], []})
+
+      GenServer.call(ws, {:terminate_worker, "itest_upgrade"})
+    end
+
     test "ensure/terminate updates cluster membership", %{ws: ws} do
       process_id = "itest_term_#{System.unique_integer([:positive])}"
 

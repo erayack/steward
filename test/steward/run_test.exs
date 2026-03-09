@@ -16,6 +16,8 @@ defmodule Steward.RunTest do
       assert run.results == %{}
       assert run.started_at == nil
       assert run.finished_at == nil
+      assert run.trigger_source == :manual
+      assert run.trigger_reason == %{}
     end
 
     test "rejects invalid attributes" do
@@ -27,6 +29,36 @@ defmodule Steward.RunTest do
 
       assert {:error, {:invalid_field, :targets}} =
                Run.new(%{run_id: "run-1", action: :restart, targets: []})
+
+      assert {:error, {:invalid_field, :trigger_source}} =
+               Run.new(%{
+                 run_id: "run-1",
+                 action: :restart,
+                 targets: ["mock_agent"],
+                 trigger_source: :unknown
+               })
+
+      assert {:error, {:invalid_field, :trigger_reason}} =
+               Run.new(%{
+                 run_id: "run-1",
+                 action: :restart,
+                 targets: ["mock_agent"],
+                 trigger_reason: 123
+               })
+    end
+
+    test "accepts explicit trigger metadata" do
+      attrs = %{
+        run_id: "run-with-trigger",
+        action: :restart,
+        targets: ["mock_agent"],
+        trigger_source: :trace,
+        trigger_reason: %{"cluster_id" => "cluster-7", "severity" => "high"}
+      }
+
+      assert {:ok, run} = Run.new(attrs)
+      assert run.trigger_source == :trace
+      assert run.trigger_reason == %{"cluster_id" => "cluster-7", "severity" => "high"}
     end
   end
 

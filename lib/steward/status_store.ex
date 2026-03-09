@@ -17,6 +17,8 @@ defmodule Steward.StatusStore do
           control_events: %{optional(String.t()) => [control_event()]},
           membership: membership_snapshot(),
           runs: runs_snapshot(),
+          metric_baselines: map(),
+          self_healing: map(),
           audit_events: [audit_event()],
           malformed_line_counts: %{optional(String.t()) => non_neg_integer()},
           updated_at_ms: integer()
@@ -99,6 +101,7 @@ defmodule Steward.StatusStore do
       control_events: %{},
       membership: initial_membership_snapshot(),
       runs: initial_runs_snapshot(),
+      metric_baselines: %{},
       audit_events: [],
       malformed_line_counts: %{},
       audit_seq: 0,
@@ -113,6 +116,7 @@ defmodule Steward.StatusStore do
     next_state =
       state
       |> put_in([:processes, process_id], snapshot)
+      |> recompute_metric_baselines()
       |> touch_updated_at()
       |> maybe_broadcast_update()
 
@@ -213,7 +217,12 @@ defmodule Steward.StatusStore do
 
   @impl true
   def handle_call(:snapshot, _from, state) do
-    {:reply, state, state}
+    snapshot =
+      state
+      |> Map.put_new(:metric_baselines, %{})
+      |> Map.put(:self_healing, self_healing_snapshot(state))
+
+    {:reply, snapshot, state}
   end
 
   defp touch_updated_at(state) do
@@ -257,6 +266,133 @@ defmodule Steward.StatusStore do
       :protocol_malformed_line -> true
       "protocol_malformed_line" -> true
       _ -> false
+    end
+  end
+
+  defp recompute_metric_baselines(state) do
+    baselines =
+      state.processes
+      |> Enum.reduce(%{}, fn {_process_id, process_snapshot}, acc ->
+        process_snapshot
+        |> extract_metrics()
+        |> Enum.reduce(acc, fn {metric_key, value}, aggregate_acc ->
+          put_metric_baseline(aggregate_acc, metric_key, value)
+        end)
+      end)
+      |> Enum.into(%{}, fn {metric_key, stat} ->
+        avg = if stat.count > 0, do: Float.round(stat.sum / stat.count, 4), else: 0.0
+        {metric_key, %{avg: avg, min: stat.min, max: stat.max, count: stat.count}}
+      end)
+
+    Map.put(state, :metric_baselines, baselines)
+  end
+
+  defp extract_metrics(process_snapshot) when is_map(process_snapshot) do
+    metrics =
+      cond do
+        is_map(Map.get(process_snapshot, :metrics)) -> Map.get(process_snapshot, :metrics)
+        is_map(Map.get(process_snapshot, "metrics")) -> Map.get(process_snapshot, "metrics")
+        true -> %{}
+      end
+
+    Enum.reduce(metrics, %{}, fn
+      {metric_key, value}, acc
+      when is_binary(metric_key) and (is_integer(value) or is_float(value)) ->
+        Map.put(acc, metric_key, value * 1.0)
+
+      {metric_key, value}, acc
+      when is_atom(metric_key) and (is_integer(value) or is_float(value)) ->
+        Map.put(acc, Atom.to_string(metric_key), value * 1.0)
+
+      _entry, acc ->
+        acc
+    end)
+  end
+
+  defp extract_metrics(_), do: %{}
+
+  defp put_metric_baseline(aggregate, metric_key, value) do
+    if metric_baseline_saturated?(aggregate, metric_key) do
+      aggregate
+    else
+      Map.update(aggregate, metric_key, init_metric_stat(value), &update_metric_stat(&1, value))
+    end
+  end
+
+  defp metric_baseline_saturated?(aggregate, metric_key) do
+    map_size(aggregate) >= metric_max_aggregate_keys() and not Map.has_key?(aggregate, metric_key)
+  end
+
+  defp init_metric_stat(value), do: %{sum: value, count: 1, min: value, max: value}
+
+  defp update_metric_stat(stat, value) do
+    %{
+      sum: stat.sum + value,
+      count: stat.count + 1,
+      min: min(stat.min, value),
+      max: max(stat.max, value)
+    }
+  end
+
+  defp self_healing_snapshot(state) do
+    cooldown_ms = self_healing_cooldown_ms()
+
+    case latest_automation_trigger(Map.get(state, :audit_events, [])) do
+      nil ->
+        %{
+          last_trigger_at_ms: nil,
+          last_trigger_reason: nil,
+          cooldown_remaining_ms: 0
+        }
+
+      event ->
+        last_trigger_at_ms = Map.get(event, :ts_ms) || 0
+
+        %{
+          last_trigger_at_ms: last_trigger_at_ms,
+          last_trigger_reason: extract_trigger_reason(event),
+          cooldown_remaining_ms:
+            max(cooldown_ms - (System.system_time(:millisecond) - last_trigger_at_ms), 0)
+        }
+    end
+  end
+
+  defp latest_automation_trigger(events) when is_list(events) do
+    events
+    |> Enum.reverse()
+    |> Enum.find(fn event ->
+      Map.get(event, :entity) in [:automation, "automation"] and
+        Map.get(event, :event) in [:automation_triggered, "automation_triggered"]
+    end)
+  end
+
+  defp latest_automation_trigger(_), do: nil
+
+  defp extract_trigger_reason(event) when is_map(event) do
+    Map.get(event, :trigger_reason) ||
+      Map.get(event, "trigger_reason") ||
+      event
+      |> Map.get(:payload, %{})
+      |> then(fn
+        payload when is_map(payload) ->
+          Map.get(payload, :trigger_reason) || Map.get(payload, "trigger_reason")
+
+        _ ->
+          nil
+      end)
+  end
+
+  defp extract_trigger_reason(_event), do: nil
+
+  defp self_healing_cooldown_ms do
+    Application.get_env(:steward, :self_healing, [])
+    |> Keyword.get(:cooldown_ms, 30_000)
+  end
+
+  defp metric_max_aggregate_keys do
+    case Application.get_env(:steward, :metrics, []) |> Keyword.get(:max_aggregate_keys, 128) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> 128
     end
   end
 

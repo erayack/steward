@@ -238,7 +238,7 @@ defmodule Steward.PortWorkerTest do
       snapshot = PortWorker.snapshot(pid)
 
       expected_keys =
-        ~w(process_id binary_path args status last_heartbeat_at last_event restart_count crash_timestamps_ms quarantined_until_ms)a
+        ~w(process_id binary_path args status last_heartbeat_at last_event metrics metric_recent metrics_updated_at restart_count crash_timestamps_ms quarantined_until_ms)a
 
       for key <- expected_keys do
         assert Map.has_key?(snapshot, key), "missing key: #{key}"
@@ -295,6 +295,42 @@ defmodule Steward.PortWorkerTest do
       GenServer.stop(pid)
     end
 
+    test "metric line updates process metrics and keeps bounded recent window" do
+      prev_cfg = Application.get_env(:steward, :metrics, [])
+      Application.put_env(:steward, :metrics, Keyword.merge(prev_cfg, window_size: 2))
+
+      on_exit(fn -> Application.put_env(:steward, :metrics, prev_cfg) end)
+
+      {:ok, pid} =
+        PortWorker.start_link(
+          process_id: "test_metric_projection",
+          binary_path: "/bin/cat",
+          args: []
+        )
+
+      state = :sys.get_state(pid)
+
+      for value <- [91.2, 88.4, 87.9] do
+        line =
+          Jason.encode!(%{
+            "kind" => "metric",
+            "ts" => "2025-01-15T10:00:00Z",
+            "fields" => %{"vantage_pct" => value}
+          })
+
+        send(pid, {state.port, {:data, {:eol, line}}})
+      end
+
+      Process.sleep(20)
+
+      snapshot = PortWorker.snapshot(pid)
+      assert snapshot.metrics["vantage_pct"] == 87.9
+      assert snapshot.metric_recent["vantage_pct"] == [88.4, 87.9]
+      assert %DateTime{} = snapshot.metrics_updated_at
+
+      GenServer.stop(pid)
+    end
+
     test "clean port exit restarts without incrementing crash counters" do
       {:ok, pid} =
         PortWorker.start_link(
@@ -328,6 +364,50 @@ defmodule Steward.PortWorkerTest do
       GenServer.stop(pid)
     end
 
+    test "hot_swap returns error when disabled in config" do
+      prev_hot_swap = Application.get_env(:steward, :hot_swap, [])
+      Application.put_env(:steward, :hot_swap, Keyword.merge(prev_hot_swap, enabled: false))
+      on_exit(fn -> Application.put_env(:steward, :hot_swap, prev_hot_swap) end)
+
+      {:ok, pid} =
+        PortWorker.start_link(
+          process_id: "test_hot_swap_disabled",
+          binary_path: "/bin/cat",
+          args: []
+        )
+
+      assert {:error, :hot_swap_disabled} = PortWorker.hot_swap(pid, "/bin/cat", [])
+
+      GenServer.stop(pid)
+    end
+
+    test "candidate exit forces active restart when fallback_on_candidate_exit is false" do
+      prev_hot_swap = Application.get_env(:steward, :hot_swap, [])
+      Application.put_env(:steward, :hot_swap, Keyword.merge(prev_hot_swap, enabled: true))
+      on_exit(fn -> Application.put_env(:steward, :hot_swap, prev_hot_swap) end)
+
+      {:ok, pid} =
+        PortWorker.start_link(
+          process_id: "test_hot_swap_no_fallback",
+          binary_path: "/bin/cat",
+          args: []
+        )
+
+      assert :ok =
+               PortWorker.hot_swap(pid, "/bin/sh", ["-c", "exit 1"],
+                 readiness_mode: :heartbeat,
+                 fallback_on_candidate_exit: false,
+                 readiness_timeout_ms: 5_000
+               )
+
+      assert_eventually(fn ->
+        snapshot = PortWorker.snapshot(pid)
+        snapshot.restart_count >= 1
+      end)
+
+      GenServer.stop(pid)
+    end
+
     test "JSONL line is parsed and updates last_event" do
       {:ok, pid} =
         PortWorker.start_link(
@@ -352,4 +432,17 @@ defmodule Steward.PortWorkerTest do
       GenServer.stop(pid)
     end
   end
+
+  defp assert_eventually(fun, attempts \\ 50)
+
+  defp assert_eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(20)
+      assert_eventually(fun, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(_fun, 0), do: flunk("condition not met within timeout")
 end

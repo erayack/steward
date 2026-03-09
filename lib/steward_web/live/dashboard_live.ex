@@ -16,6 +16,7 @@ defmodule StewardWeb.DashboardLive do
      |> assign(:nodes, payload.nodes)
      |> assign(:processes, payload.processes)
      |> assign(:runs, payload.runs)
+     |> assign(:automation_cards, payload.automation_cards || [])
      |> assign(:updated_at_ms, payload.updated_at_ms)}
   end
 
@@ -29,6 +30,7 @@ defmodule StewardWeb.DashboardLive do
      |> assign(:nodes, payload.nodes)
      |> assign(:processes, payload.processes)
      |> assign(:runs, payload.runs)
+     |> assign(:automation_cards, payload.automation_cards || [])
      |> assign(:updated_at_ms, payload.updated_at_ms)}
   end
 
@@ -66,6 +68,20 @@ defmodule StewardWeb.DashboardLive do
       </section>
 
       <section>
+        <h2>Automation</h2>
+        <div style="display: grid; gap: 0.75rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));">
+          <article
+            :for={card <- @automation_cards}
+            style="border: 1px solid #d8d8d8; border-radius: 8px; padding: 0.75rem; background: #fafafa;"
+          >
+            <strong><%= card.title %></strong>
+            <p>Status: <%= String.upcase(card.status) %></p>
+            <p>Cooldown remaining (ms): <%= card.cooldown_remaining_ms %></p>
+          </article>
+        </div>
+      </section>
+
+      <section>
         <h2>Processes</h2>
         <table style="width: 100%; border-collapse: collapse;">
           <thead>
@@ -74,6 +90,7 @@ defmodule StewardWeb.DashboardLive do
               <th style="text-align: left; border-bottom: 1px solid #ddd;">Status</th>
               <th style="text-align: left; border-bottom: 1px solid #ddd;">Heartbeat Age (ms)</th>
               <th style="text-align: left; border-bottom: 1px solid #ddd;">Restarts</th>
+              <th style="text-align: left; border-bottom: 1px solid #ddd;">Vantage %</th>
             </tr>
           </thead>
           <tbody>
@@ -82,6 +99,7 @@ defmodule StewardWeb.DashboardLive do
               <td style="padding: 0.35rem 0;"><%= String.upcase(proc.status) %></td>
               <td style="padding: 0.35rem 0;"><%= proc.heartbeat_age_ms || "n/a" %></td>
               <td style="padding: 0.35rem 0;"><%= proc.restart_count %></td>
+              <td style="padding: 0.35rem 0;"><%= proc.vantage_pct || "n/a" %></td>
             </tr>
           </tbody>
         </table>

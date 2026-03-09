@@ -55,6 +55,61 @@ defmodule StewardWeb.PresenterTest do
     assert Enum.any?(calls, fn params -> Map.get(params, :process_id) == process_id end)
   end
 
+  test "state_payload includes metric-derived process fields and automation cards" do
+    now = DateTime.utc_now()
+    prev_self_healing = Application.get_env(:steward, :self_healing, [])
+
+    Application.put_env(
+      :steward,
+      :self_healing,
+      Keyword.merge(prev_self_healing, cooldown_ms: 60_000)
+    )
+
+    on_exit(fn -> Application.put_env(:steward, :self_healing, prev_self_healing) end)
+
+    :sys.replace_state(StatusStore, fn state ->
+      Map.merge(state, %{
+        processes: %{
+          "proc_1" => %{
+            process_id: "proc_1",
+            status: :up,
+            last_heartbeat_at: now,
+            restart_count: 1,
+            quarantined_until_ms: nil,
+            metrics: %{"vantage_pct" => 92.1, "cpu" => 0.62, "error_rate" => 0.03},
+            metric_recent: %{"vantage_pct" => [94.0, 93.0, 92.1]},
+            metrics_updated_at: now
+          }
+        },
+        metric_baselines: %{"vantage_pct" => %{avg: 92.1, min: 92.1, max: 92.1, count: 1}},
+        audit_events: [
+          %{
+            entity: :automation,
+            event: :automation_triggered,
+            ts_ms: System.system_time(:millisecond),
+            trigger_reason: %{signal: :vantage_drop_pct}
+          }
+        ]
+      })
+    end)
+
+    payload = Presenter.state_payload()
+    [proc] = payload.processes
+    [card] = payload.automation_cards
+
+    assert proc.vantage_pct == 92.1
+    assert proc.cpu == 0.62
+    assert proc.error_rate == 0.03
+    assert proc.metric_recent["vantage_pct"] == [94.0, 93.0, 92.1]
+    assert is_binary(proc.metrics_updated_at)
+
+    assert payload.metric_baselines["vantage_pct"].avg == 92.1
+    assert card.id == "self_healing"
+    assert card.status == "cooldown"
+    assert card.cooldown_remaining_ms > 0
+    assert card.last_trigger_reason == %{signal: :vantage_drop_pct}
+  end
+
   defp wait_until_attached(process_id), do: wait_until_attached(process_id, 20)
 
   defp wait_until_attached(_process_id, 0),

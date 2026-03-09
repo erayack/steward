@@ -1,7 +1,7 @@
 defmodule Steward do
   @moduledoc "Steward composition root and CLI command dispatcher."
 
-  alias Steward.{CLI, RunExecutor, RunRegistry, WorkerSupervisor}
+  alias Steward.{CLI, RunExecutor, RunRegistry, StatusStore, WorkerSupervisor}
 
   @type started_apps :: [atom()]
 
@@ -54,6 +54,12 @@ defmodule Steward do
     {:ok, WorkerSupervisor.list_workers()}
   end
 
+  @spec upgrade_worker(String.t(), String.t(), [String.t()], keyword()) :: :ok | {:error, term()}
+  def upgrade_worker(process_id, binary_path, args, opts \\ [])
+      when is_binary(process_id) and is_binary(binary_path) and is_list(args) and is_list(opts) do
+    WorkerSupervisor.upgrade_worker(process_id, binary_path, args, opts)
+  end
+
   defp dispatch({:start, start_opts}) do
     with {:ok, _started_apps} <- start_runtime(overrides: start_overrides(start_opts)) do
       print_start_banner(start_opts)
@@ -87,6 +93,34 @@ defmodule Steward do
     end
   end
 
+  defp dispatch({:workers, {:upgrade, attrs}}) do
+    with {:ok, started_apps} <- start_runtime(overrides: one_shot_overrides()) do
+      try do
+        process_id = Map.fetch!(attrs, :process_id)
+        binary_path = Map.fetch!(attrs, :binary_path)
+        args = Map.get(attrs, :args, [])
+        opts = Map.get(attrs, :opts, [])
+
+        case upgrade_worker(process_id, binary_path, args, opts) do
+          :ok ->
+            case await_upgrade_completion(process_id, upgrade_wait_timeout_ms(opts)) do
+              :ok ->
+                IO.puts("upgrade finished for #{process_id}")
+                :ok
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      after
+        stop_runtime(started_apps)
+      end
+    end
+  end
+
   defp start_overrides(start_opts) do
     server =
       [enabled: Map.get(start_opts, :server_enabled, true)]
@@ -98,6 +132,80 @@ defmodule Steward do
   defp one_shot_overrides do
     [server: [enabled: false]]
   end
+
+  defp upgrade_wait_timeout_ms(opts) when is_list(opts) do
+    readiness_timeout_ms =
+      positive_timeout_or_default(Keyword.get(opts, :readiness_timeout_ms), 15_000)
+
+    graceful_shutdown_timeout_ms =
+      positive_timeout_or_default(Keyword.get(opts, :graceful_shutdown_timeout_ms), 10_000)
+
+    readiness_timeout_ms + graceful_shutdown_timeout_ms + 5_000
+  end
+
+  defp await_upgrade_completion(process_id, timeout_ms)
+       when is_binary(process_id) and is_integer(timeout_ms) and timeout_ms > 0 do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_await_upgrade_completion(process_id, deadline_ms, false)
+  end
+
+  defp do_await_upgrade_completion(process_id, deadline_ms, seen_in_progress?) do
+    snapshot = StatusStore.get_process_snapshot(process_id)
+    now_ms = System.monotonic_time(:millisecond)
+
+    cond do
+      is_nil(snapshot) ->
+        {:error, :not_found}
+
+      now_ms >= deadline_ms ->
+        {:error, :upgrade_timeout}
+
+      true ->
+        case normalize_upgrade_state(Map.get(snapshot, :upgrade_state)) do
+          :failed ->
+            {:error, :upgrade_failed}
+
+          :rolled_back ->
+            {:error, :upgrade_rolled_back}
+
+          :idle when seen_in_progress? ->
+            :ok
+
+          :idle ->
+            Process.sleep(50)
+            do_await_upgrade_completion(process_id, deadline_ms, seen_in_progress?)
+
+          _in_progress ->
+            Process.sleep(50)
+            do_await_upgrade_completion(process_id, deadline_ms, true)
+        end
+    end
+  end
+
+  defp normalize_upgrade_state(state) when state in [:starting, :waiting_ready, :draining],
+    do: state
+
+  defp normalize_upgrade_state(state) when state in [:idle, :failed, :rolled_back],
+    do: state
+
+  defp normalize_upgrade_state(state) when is_binary(state) do
+    case state do
+      "starting" -> :starting
+      "waiting_ready" -> :waiting_ready
+      "draining" -> :draining
+      "idle" -> :idle
+      "failed" -> :failed
+      "rolled_back" -> :rolled_back
+      _ -> :idle
+    end
+  end
+
+  defp normalize_upgrade_state(_), do: :idle
+
+  defp positive_timeout_or_default(value, _default) when is_integer(value) and value > 0,
+    do: value
+
+  defp positive_timeout_or_default(_value, default), do: default
 
   defp apply_runtime_overrides(opts) do
     overrides = Keyword.get(opts, :overrides, [])

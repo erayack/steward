@@ -21,6 +21,33 @@ config :steward,
     idempotency_max_ids_per_node: 10_000,
     completed_runs_max: 1_000
   ],
+  self_healing: [
+    enabled: false,
+    evaluation_interval_ms: 5_000,
+    leader_mode: :lowest_node,
+    cooldown_ms: 30_000,
+    vantage_drop_threshold_pct: 25.0,
+    default_action: :panic_fail_open
+  ],
+  metrics: [
+    window_size: 10,
+    max_keys_per_process: 64,
+    max_aggregate_keys: 128
+  ],
+  trace_analysis: [
+    enabled: false,
+    window_ms: 60_000,
+    cluster_min_size: 3,
+    latency_inversion_ratio_threshold: 1.5,
+    auto_trigger_action: :panic_fail_open
+  ],
+  hot_swap: [
+    enabled: false,
+    readiness_mode: :port_open,
+    readiness_timeout_ms: 15_000,
+    graceful_shutdown_timeout_ms: 10_000,
+    fallback_on_candidate_exit: true
+  ],
   audit: [
     max_events: 2_000,
     sink_enabled: false,

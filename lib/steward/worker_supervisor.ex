@@ -46,6 +46,13 @@ defmodule Steward.WorkerSupervisor do
     GenServer.call(__MODULE__, :list_workers)
   end
 
+  @spec upgrade_worker(Types.process_id(), String.t(), [String.t()], keyword()) ::
+          :ok | {:error, term()}
+  def upgrade_worker(process_id, binary_path, args \\ [], opts \\ [])
+      when is_binary(process_id) and is_binary(binary_path) and is_list(args) and is_list(opts) do
+    GenServer.call(__MODULE__, {:upgrade_worker, process_id, binary_path, args, opts})
+  end
+
   @impl true
   def init(opts) do
     state = %{
@@ -84,26 +91,7 @@ defmodule Steward.WorkerSupervisor do
   end
 
   def handle_call({:terminate_worker, process_id}, _from, state) do
-    {result, next_state} =
-      case Map.has_key?(state.api_workers, process_id) do
-        true ->
-          {:ok, %{state | api_workers: Map.delete(state.api_workers, process_id)}}
-
-        false ->
-          result =
-            case lookup_worker_pid(process_id, state.registry) do
-              {:ok, pid} ->
-                case DynamicSupervisor.terminate_child(state.dynamic_supervisor, pid) do
-                  :ok -> :ok
-                  {:error, :not_found} -> :ok
-                end
-
-              :error ->
-                :ok
-            end
-
-          {result, state}
-      end
+    {result, next_state} = do_terminate_worker(process_id, state)
 
     Steward.ClusterMembership.detach_process(node(), process_id)
     {:reply, result, next_state}
@@ -111,6 +99,36 @@ defmodule Steward.WorkerSupervisor do
 
   def handle_call(:list_workers, _from, state) do
     {:reply, list_worker_refs(state.registry, state.api_workers), state}
+  end
+
+  def handle_call({:upgrade_worker, process_id, binary_path, args, opts}, _from, state) do
+    result =
+      cond do
+        not hot_swap_enabled?() ->
+          {:error, :hot_swap_disabled}
+
+        not valid_process_id?(process_id) ->
+          {:error, :invalid_process_id}
+
+        not is_binary(binary_path) or binary_path == "" ->
+          {:error, :invalid_binary_path}
+
+        not valid_args?(args) ->
+          {:error, :invalid_args}
+
+        Map.has_key?(state.api_workers, process_id) ->
+          {:error, :unsupported_transport}
+
+        true ->
+          do_upgrade_worker(process_id, binary_path, args, opts, state)
+      end
+
+    {:reply, result, state}
+  end
+
+  defp hot_swap_enabled? do
+    Application.get_env(:steward, :hot_swap, [])
+    |> Keyword.get(:enabled, false)
   end
 
   @impl true
@@ -170,6 +188,37 @@ defmodule Steward.WorkerSupervisor do
         |> normalize_start_result(process_id, state.registry)
     end
   end
+
+  defp do_terminate_worker(process_id, state) do
+    if Map.has_key?(state.api_workers, process_id) do
+      {:ok, %{state | api_workers: Map.delete(state.api_workers, process_id)}}
+    else
+      {terminate_port_worker(process_id, state), state}
+    end
+  end
+
+  defp do_upgrade_worker(process_id, binary_path, args, opts, state) do
+    case lookup_worker_pid(process_id, state.registry) do
+      {:ok, pid} -> Steward.PortWorker.hot_swap(pid, binary_path, args, opts)
+      :error -> {:error, :not_found}
+    end
+  end
+
+  defp terminate_port_worker(process_id, state) do
+    case lookup_worker_pid(process_id, state.registry) do
+      {:ok, pid} ->
+        normalize_terminate_result(
+          DynamicSupervisor.terminate_child(state.dynamic_supervisor, pid)
+        )
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp normalize_terminate_result(:ok), do: :ok
+  defp normalize_terminate_result({:error, :not_found}), do: :ok
+  defp normalize_terminate_result({:error, reason}), do: {:error, reason}
 
   defp normalize_start_result({:ok, pid}, _process_id, _registry), do: {:ok, pid}
   defp normalize_start_result({:ok, pid, _info}, _process_id, _registry), do: {:ok, pid}

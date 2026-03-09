@@ -26,6 +26,8 @@ defmodule StewardWeb.Router do
     post("/agents/register", AgentAPIController, :register)
     post("/agents/:process_id/heartbeat", AgentAPIController, :heartbeat)
     post("/agents/:process_id/events", AgentAPIController, :events)
+    post("/workers/:process_id/upgrade", WorkerAPIController, :upgrade)
+    get("/workers/:process_id", WorkerAPIController, :show)
   end
 
   scope "/", StewardWeb do

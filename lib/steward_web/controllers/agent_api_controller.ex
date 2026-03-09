@@ -5,77 +5,80 @@ defmodule StewardWeb.AgentAPIController do
   alias Steward.{ClusterMembership, StatusStore}
 
   def register(conn, params) do
-    with {:ok, process_id} <- fetch_process_id(params) do
-      now = DateTime.utc_now()
-      metadata = Map.get(params, "metadata") || %{}
+    case fetch_process_id(params) do
+      {:ok, process_id} ->
+        now = DateTime.utc_now()
+        metadata = Map.get(params, "metadata") || %{}
 
-      ClusterMembership.attach_process(node(), process_id)
+        ClusterMembership.attach_process(node(), process_id)
 
-      snapshot =
-        process_id
-        |> base_snapshot()
-        |> Map.put(:status, :up)
-        |> Map.put(:last_heartbeat_at, now)
-        |> Map.put(:last_event, %{type: :agent_registered, at: now, metadata: metadata})
-        |> Map.put(:metadata, metadata)
+        snapshot =
+          process_id
+          |> base_snapshot()
+          |> Map.put(:status, :up)
+          |> Map.put(:last_heartbeat_at, now)
+          |> Map.put(:last_event, %{type: :agent_registered, at: now, metadata: metadata})
+          |> Map.put(:metadata, metadata)
 
-      StatusStore.upsert_process_snapshot(process_id, snapshot)
-      StatusStore.record_control_event(process_id, :agent_registered, %{metadata: metadata})
+        StatusStore.upsert_process_snapshot(process_id, snapshot)
+        StatusStore.record_control_event(process_id, :agent_registered, %{metadata: metadata})
 
-      json(conn, %{ok: true, process_id: process_id})
-    else
+        json(conn, %{ok: true, process_id: process_id})
+
       {:error, :missing_process_id} ->
         conn |> put_status(:unprocessable_entity) |> json(%{error: "missing_process_id"})
     end
   end
 
   def heartbeat(conn, %{"process_id" => process_id} = params) do
-    with {:ok, process_id} <- fetch_process_id(%{"process_id" => process_id}) do
-      ts = parse_timestamp(Map.get(params, "ts"), DateTime.utc_now())
+    case fetch_process_id(%{"process_id" => process_id}) do
+      {:ok, process_id} ->
+        ts = parse_timestamp(Map.get(params, "ts"), DateTime.utc_now())
 
-      ClusterMembership.attach_process(node(), process_id)
+        ClusterMembership.attach_process(node(), process_id)
 
-      snapshot =
-        process_id
-        |> base_snapshot()
-        |> Map.put(:status, :up)
-        |> Map.put(:last_heartbeat_at, ts)
-        |> Map.put(:last_event, %{type: :heartbeat, at: ts})
+        snapshot =
+          process_id
+          |> base_snapshot()
+          |> Map.put(:status, :up)
+          |> Map.put(:last_heartbeat_at, ts)
+          |> Map.put(:last_event, %{type: :heartbeat, at: ts})
 
-      StatusStore.upsert_process_snapshot(process_id, snapshot)
-      StatusStore.record_control_event(process_id, :heartbeat, %{at: DateTime.to_iso8601(ts)})
+        StatusStore.upsert_process_snapshot(process_id, snapshot)
+        StatusStore.record_control_event(process_id, :heartbeat, %{at: DateTime.to_iso8601(ts)})
 
-      json(conn, %{ok: true, process_id: process_id})
-    else
+        json(conn, %{ok: true, process_id: process_id})
+
       {:error, :missing_process_id} ->
         conn |> put_status(:unprocessable_entity) |> json(%{error: "missing_process_id"})
     end
   end
 
   def events(conn, %{"process_id" => process_id} = params) do
-    with {:ok, process_id} <- fetch_process_id(%{"process_id" => process_id}) do
-      events = normalize_events(params)
-      now = DateTime.utc_now()
+    case fetch_process_id(%{"process_id" => process_id}) do
+      {:ok, process_id} ->
+        events = normalize_events(params)
+        now = DateTime.utc_now()
 
-      Enum.each(events, fn event ->
-        kind = Map.get(event, "kind") || Map.get(event, :kind) || "event"
-        payload = Map.get(event, "payload") || Map.get(event, :payload) || %{}
+        Enum.each(events, fn event ->
+          kind = Map.get(event, "kind") || Map.get(event, :kind) || "event"
+          payload = Map.get(event, "payload") || Map.get(event, :payload) || %{}
 
-        StatusStore.record_control_event(process_id, :agent_event, %{
-          kind: kind,
-          payload: payload
-        })
-      end)
+          StatusStore.record_control_event(process_id, :agent_event, %{
+            kind: kind,
+            payload: payload
+          })
+        end)
 
-      snapshot =
-        process_id
-        |> base_snapshot()
-        |> Map.put(:status, :up)
-        |> Map.put(:last_event, %{type: :agent_event, count: length(events), at: now})
+        snapshot =
+          process_id
+          |> base_snapshot()
+          |> Map.put(:status, :up)
+          |> Map.put(:last_event, %{type: :agent_event, count: length(events), at: now})
 
-      StatusStore.upsert_process_snapshot(process_id, snapshot)
-      json(conn, %{ok: true, process_id: process_id, accepted: length(events)})
-    else
+        StatusStore.upsert_process_snapshot(process_id, snapshot)
+        json(conn, %{ok: true, process_id: process_id, accepted: length(events)})
+
       {:error, :missing_process_id} ->
         conn |> put_status(:unprocessable_entity) |> json(%{error: "missing_process_id"})
     end

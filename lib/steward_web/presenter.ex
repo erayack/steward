@@ -34,6 +34,7 @@ defmodule StewardWeb.Presenter do
       |> Enum.sort_by(& &1.node)
 
     run_feed = project_run_feed(snapshot.runs)
+    automation_cards = project_automation_cards(snapshot)
 
     %{
       summary: %{
@@ -47,6 +48,8 @@ defmodule StewardWeb.Presenter do
       nodes: node_cards,
       processes: process_rows,
       runs: run_feed,
+      metric_baselines: Map.get(snapshot, :metric_baselines, %{}),
+      automation_cards: automation_cards,
       updated_at_ms: snapshot.updated_at_ms
     }
   end
@@ -140,8 +143,30 @@ defmodule StewardWeb.Presenter do
       status: normalize_status(snapshot.status),
       heartbeat_age_ms: heartbeat_age_ms,
       restart_count: snapshot.restart_count,
-      quarantined_until_ms: snapshot.quarantined_until_ms
+      quarantined_until_ms: snapshot.quarantined_until_ms,
+      metrics_updated_at: format_dt(Map.get(snapshot, :metrics_updated_at)),
+      metrics: Map.get(snapshot, :metrics, %{}),
+      metric_recent: Map.get(snapshot, :metric_recent, %{}),
+      vantage_pct: metric_value(snapshot, ["vantage_pct", "vantage_percent", "vantage"]),
+      cpu: metric_value(snapshot, ["cpu", "cpu_pct", "cpu_percent"]),
+      error_rate: metric_value(snapshot, ["error_rate", "error_pct", "error_percent"])
     }
+  end
+
+  defp project_automation_cards(snapshot) do
+    self_healing = Map.get(snapshot, :self_healing, %{})
+    cooldown_remaining_ms = Map.get(self_healing, :cooldown_remaining_ms, 0)
+
+    [
+      %{
+        id: "self_healing",
+        title: "Self-healing",
+        status: if(cooldown_remaining_ms > 0, do: "cooldown", else: "ready"),
+        last_trigger_at_ms: Map.get(self_healing, :last_trigger_at_ms),
+        last_trigger_reason: Map.get(self_healing, :last_trigger_reason),
+        cooldown_remaining_ms: cooldown_remaining_ms
+      }
+    ]
   end
 
   defp project_run_feed(runs) do
@@ -164,6 +189,11 @@ defmodule StewardWeb.Presenter do
 
   defp normalize_status(status) when is_atom(status), do: Atom.to_string(status)
   defp normalize_status(status), do: to_string(status)
+
+  defp metric_value(snapshot, candidate_keys) do
+    metrics = Map.get(snapshot, :metrics, %{})
+    Enum.find_value(candidate_keys, &Map.get(metrics, &1))
+  end
 
   defp format_dt(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
   defp format_dt(_), do: nil

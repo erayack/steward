@@ -7,7 +7,9 @@ defmodule Steward.Run do
   def new(attrs) when is_map(attrs) do
     with {:ok, run_id} <- fetch_non_empty_binary(attrs, :run_id),
          {:ok, action} <- fetch_atom(attrs, :action),
-         {:ok, targets} <- fetch_targets(attrs) do
+         {:ok, targets} <- fetch_targets(attrs),
+         {:ok, trigger_source} <- fetch_trigger_source(attrs),
+         {:ok, trigger_reason} <- fetch_trigger_reason(attrs) do
       run = %RunType{
         run_id: run_id,
         action: action,
@@ -17,7 +19,9 @@ defmodule Steward.Run do
         status: :pending,
         results: %{},
         started_at: nil,
-        finished_at: nil
+        finished_at: nil,
+        trigger_source: trigger_source,
+        trigger_reason: trigger_reason
       }
 
       {:ok, run}
@@ -73,6 +77,20 @@ defmodule Steward.Run do
 
   defp validate_targets(targets) do
     if valid_targets?(targets), do: {:ok, targets}, else: {:error, {:invalid_field, :targets}}
+  end
+
+  defp fetch_trigger_source(attrs) do
+    case Map.get(attrs, :trigger_source, :manual) do
+      source when source in [:manual, :metric, :trace, :operator] -> {:ok, source}
+      _ -> {:error, {:invalid_field, :trigger_source}}
+    end
+  end
+
+  defp fetch_trigger_reason(attrs) do
+    case Map.get(attrs, :trigger_reason, %{}) do
+      reason when is_map(reason) or is_binary(reason) -> {:ok, reason}
+      _ -> {:error, {:invalid_field, :trigger_reason}}
+    end
   end
 
   defp fetch_map(attrs, key, default) do
